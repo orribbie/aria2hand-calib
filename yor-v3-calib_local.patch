@@ -1,0 +1,644 @@
+diff --git a/README.md b/README.md
+index 485ac2d..a8a2761 100644
+--- a/README.md
++++ b/README.md
+@@ -31,8 +31,11 @@ start your existing Nero arm RPC server and rectified Aria camera publisher firs
+   relative to one another requires recalibration. The model has a fixed
+   `arms_mount`; it does not model chassis/lift motion.
+ - Attach a **DICT_4X4_250** marker, default **ID 0**, to the calibration mount.
+-  The detected outer black square must measure **65 × 65 mm**, excluding white
+-  margins. Match its position and orientation to the model: decoded corners
++  Measure the outer black square, excluding white margins. The bundled model
++  defaults to **65 × 65 mm**; pass `--marker-size-mm 60` to the fitter for a
++  **60 × 60 mm** print. Size is stored in the calibration and used by subsequent
++  checks. Scaling preserves the modeled marker center. Match its position and
++  orientation to the model: decoded corners
+   **TL, TR, BR, BL → R_U, L_U, L_B, R_B**. A rotated print or wrong mount can
+   produce misleading results; verify physically.
+ - Initialize/enable the robot using its normal controller. Verify that joint
+@@ -115,6 +118,34 @@ the command reports the shortfall.
+ 
+ ## 4. Use the result
+ 
++For the measured 60 mm marker with a thin white rim on a dark mount, use:
++
++```bash
++yor-calib-auto --arm left --count 30 --camera-host 127.0.0.1 \
++  --require-fresh --refine-template --seed 91 --output data/train60
++yor-calib-fit --data data/train60 --marker-size-mm 60
++yor-calib-auto --arm left --count 12 --camera-host 127.0.0.1 \
++  --require-fresh --refine-template --seed 123 --output data/holdout60
++python tools/validate_calibration.py --data data/holdout60 \
++  --calibration data/train60/hand_eye_calibration_left.npz
++```
++
++`--require-fresh` requires a synchronized `capture_time_unix` in the image
++packet and waits for an image captured after settling. Collector and publisher
++must share a synchronized wall clock. Repeated `buffer=False` reads alone can
++return cached frames. `--refine-template` aligns the marker's interior code cells
++to avoid switching between its black square and the surrounding border; failed
++alignments are rejected. Use the same option for held-out checks.
++
++The Aria publisher patch in `tools/aria_publisher_freshness.patch` moves slow
++rectification out of the decoder callback and publishes capture timestamps
++using Aria time synchronization. It applies to `demos/aria_calib_pub.py` in the
++local `yor_demos` checkout. Restart the publisher after applying it.
++
++Validation saves per-corner errors and cropped overlays in the held-out dataset's
++`validation/` directory: green circles are observations, red crosses predictions.
++It does not refit or remove any held-out samples.
++
+ `hand_eye_calibration_left.npz` stores **`T_C_B` (alias `T_eye_base`) from the
+ shared MuJoCo world/arm-mount frame to the RGB camera frame**, not from an
+ individual shoulder. Units are meters; RGB axes follow OpenCV (+x right, +y down,
+diff --git a/pyproject.toml b/pyproject.toml
+index 73904e5..022dfac 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,7 +10,7 @@ readme = "README.md"
+ requires-python = ">=3.10"
+ license = "MIT"
+ authors = [{name = "NYU Generalizable Robotics and AI Lab (GRAIL)"}]
+-dependencies = ["numpy>=1.26,<3", "mujoco==3.5.0", "opencv-contrib-python-headless==4.13.0.92"]
++dependencies = ["numpy>=1.26,<3", "scipy>=1.10,<2", "mujoco==3.5.0", "opencv-contrib-python-headless==4.13.0.92"]
+ 
+ [project.optional-dependencies]
+ live = ["commlink==0.4.2", "pyzmq>=25,<28"]
+diff --git a/src/yor_v3_calib/calibration.py b/src/yor_v3_calib/calibration.py
+index b2e78f4..a5ed94f 100644
+--- a/src/yor_v3_calib/calibration.py
++++ b/src/yor_v3_calib/calibration.py
+@@ -12,7 +12,10 @@ import numpy as np
+ from .config import ARUCO_MJCF, ARM_JOINTS, CORNER_SITES, DATA, initial_q, rigid_transform
+ 
+ 
+-def marker_points(joint_rows, side="left", *, mjcf_path=ARUCO_MJCF):
++def marker_points(joint_rows, side="left", *, mjcf_path=ARUCO_MJCF, marker_size_m=.065,
++                  marker_correction=None):
++    if not np.isfinite(marker_size_m) or marker_size_m <= 0:
++        raise ValueError("Marker size must be positive and finite")
+     if side not in ARM_JOINTS:
+         raise ValueError("side must be left or right")
+     rows = np.asarray(joint_rows, dtype=np.float64)
+@@ -30,7 +33,78 @@ def marker_points(joint_rows, side="left", *, mjcf_path=ARUCO_MJCF):
+         data.qpos[model.jnt_qposadr[joints]] = q
+         mujoco.mj_forward(model, data)
+         result[i] = data.site_xpos[sites]
+-    return result
++    centers = result.mean(axis=1, keepdims=True)
++    result = centers + (result - centers) * (marker_size_m / .065)
++    return correct_marker_points(result, marker_correction) if marker_correction is not None else result
++
++
++def correct_marker_points(xyz, correction):
++    """Apply a mounting correction in the nominal marker's centered frame.
++
++    Marker +x is TL->TR, +y is TL->BL, +z is their cross product.
++    The correction maps actual marker coordinates into that nominal frame.
++    """
++    correction = rigid_transform(correction)
++    center = xyz.mean(axis=1, keepdims=True)
++    a, b = xyz[:, 1]-xyz[:, 0], xyz[:, 3]-xyz[:, 0]
++    a = a / np.linalg.norm(a, axis=1, keepdims=True)
++    b = b / np.linalg.norm(b, axis=1, keepdims=True)
++    basis = np.stack([a, b, np.cross(a, b)], axis=2)
++    local = np.einsum('nji,nkj->nki', basis, xyz-center)
++    local = local @ correction[:3, :3].T + correction[:3, 3]
++    return center + np.einsum('nij,nkj->nki', basis, local)
++
++
++def estimate_extrinsics_and_mount(xyz, uv, K, D=None, *, threshold_px=3.):
++    """Jointly fit fixed camera and marker mount; requires orientation diversity.
++
++    An effective mounting correction can also absorb terminal joint zero error.
++    Validate on new poses before using the result outside the sampled workspace.
++    """
++    from scipy.optimize import least_squares
++
++    xyz, uv, K = (np.asarray(value, dtype=float) for value in (xyz, uv, K))
++    if not np.isfinite(threshold_px) or threshold_px <= 0:
++        raise ValueError('threshold_px must be positive')
++    # Reuse the ordinary fitter's input and spatial-diversity validation.
++    # A relaxed initialization gate is not the final acceptance threshold.
++    T0, _, _ = estimate_extrinsics(xyz, uv, K, D, threshold_px=max(30., threshold_px))
++    if len(xyz) < 12:
++        raise ValueError('Mount fitting requires at least 12 varied poses')
++    D = np.zeros(5) if D is None else D
++    z0 = np.r_[cv2.Rodrigues(T0[:3, :3])[0].ravel(), T0[:3, 3], np.zeros(6)]
++
++    def correction(z):
++        result = np.eye(4)
++        result[:3, :3] = cv2.Rodrigues(z[6:9])[0]
++        result[:3, 3] = z[9:12]
++        return result
++
++    def residual(z):
++        points = correct_marker_points(xyz, correction(z))
++        predicted = cv2.projectPoints(points.reshape(-1, 3), z[:3], z[3:6], K, D)[0]
++        return (predicted.reshape(uv.shape)-uv).ravel()
++
++    bounds = np.r_[np.full(6, np.inf), np.full(3, np.deg2rad(20)), np.full(3, .05)]
++    fit = least_squares(residual, z0, bounds=(-bounds, bounds), loss='soft_l1',
++                        f_scale=2., x_scale='jac', max_nfev=300)
++    if not fit.success or np.any(fit.active_mask):
++        raise ValueError('Mount fit did not converge within the correction bounds')
++    # Rank is measured after normalizing columns because meters and radians differ.
++    J = fit.jac / np.maximum(np.linalg.norm(fit.jac, axis=0), 1e-12)
++    if np.linalg.svd(J, compute_uv=False)[-1] < 1e-4:
++        raise ValueError('Insufficient orientation diversity to identify marker mounting')
++    errors = np.linalg.norm(residual(fit.x).reshape(-1, 4, 2), axis=2).mean(axis=1)
++    mask = errors < threshold_px
++    if mask.sum() < max(6, int(np.ceil(.6*len(xyz)))):
++        raise ValueError('Mount fit has fewer than 60% inliers')
++    T = np.eye(4)
++    T[:3, :3], T[:3, 3] = cv2.Rodrigues(fit.x[:3])[0], fit.x[3:6]
++    mount = correction(fit.x)
++    pts = correct_marker_points(xyz, mount)
++    if np.any((pts.reshape(-1, 3) @ T[:3, :3].T + T[:3, 3])[:, 2] <= 0):
++        raise ValueError('Mount fit places points behind the camera')
++    return rigid_transform(T), errors, mask, mount
+ 
+ 
+ def estimate_extrinsics(xyz, uv, K, D=None, *, threshold_px=3., seed=0):
+@@ -93,14 +167,17 @@ def estimate_extrinsics(xyz, uv, K, D=None, *, threshold_px=3., seed=0):
+     return rigid_transform(T), e, mask
+ 
+ 
+-def save_calibration(path, T_C_B, K, D, *, side, errors, inliers):
++def save_calibration(path, T_C_B, K, D, *, side, errors, inliers, marker_size_m=.065,
++                     marker_correction=None):
+     T = rigid_transform(T_C_B)
+     path = Path(path)
+     path.parent.mkdir(parents=True, exist_ok=True)
++    extra = {} if marker_correction is None else {'marker_correction': rigid_transform(marker_correction)}
++    extra['calibration_method'] = 'camera_and_marker_mount' if marker_correction is not None else 'fixed_marker_mount'
+     np.savez(path, embodiment="YOR-v3", T_C_B=T, T_eye_base=T, R_C_B=T[:3, :3],
+              tvec=T[:3, 3, None], rvec=cv2.Rodrigues(T[:3, :3])[0],
+-             camera_matrix=K, dist_coeffs=D, arm=side,
+-             corner_sites=np.array(CORNER_SITES[side]), pose_errors_px=errors, inliers=inliers)
++             camera_matrix=K, dist_coeffs=D, arm=side, marker_size_m=marker_size_m,
++             corner_sites=np.array(CORNER_SITES[side]), pose_errors_px=errors, inliers=inliers, **extra)
+     np.save(path.with_name(f"eye_to_base_{side}.npy"), np.linalg.inv(T))
+ 
+ 
+@@ -109,14 +186,26 @@ def main():
+     p.add_argument("--arm", choices=tuple(ARM_JOINTS), default="left")
+     p.add_argument("--data", type=Path, default=DATA)
+     p.add_argument("--threshold-px", type=float, default=3.)
++    p.add_argument("--marker-size-mm", type=float, default=65.,
++                   help="Measured outer black square, excluding white border")
++    p.add_argument("--fit-marker-mount", action="store_true",
++                   help="Also estimate marker mounting correction (12+ varied poses)")
+     args = p.parse_args()
+     with np.load(args.data / "camera_intrinsics.npz", allow_pickle=False) as f:
+         K, D = f["camera_matrix"], f["dist_coeffs"]
+-    xyz = marker_points(np.load(args.data / f"joint_angles_{args.arm}.npy"), args.arm)
++    xyz = marker_points(np.load(args.data / f"joint_angles_{args.arm}.npy"), args.arm,
++                        marker_size_m=args.marker_size_mm / 1000)
+     uv = np.load(args.data / f"two_d_coordinates_{args.arm}.npy")
+-    T, errors, inliers = estimate_extrinsics(xyz, uv, K, D, threshold_px=args.threshold_px)
++    mount = None
++    if args.fit_marker_mount:
++        T, errors, inliers, mount = estimate_extrinsics_and_mount(
++            xyz, uv, K, D, threshold_px=args.threshold_px)
++        xyz = correct_marker_points(xyz, mount)
++    else:
++        T, errors, inliers = estimate_extrinsics(xyz, uv, K, D, threshold_px=args.threshold_px)
+     out = args.data / f"hand_eye_calibration_{args.arm}.npz"
+-    save_calibration(out, T, K, D, side=args.arm, errors=errors, inliers=inliers)
++    save_calibration(out, T, K, D, side=args.arm, errors=errors, inliers=inliers,
++                     marker_size_m=args.marker_size_mm / 1000, marker_correction=mount)
+     np.save(args.data / f"three_d_coordinates_{args.arm}.npy", xyz)
+     print(f"Saved {out}; {inliers.sum()}/{len(inliers)} poses, mean inlier error {errors[inliers].mean():.3f} px")
+ 
+diff --git a/src/yor_v3_calib/collect.py b/src/yor_v3_calib/collect.py
+index 24ae655..f90e189 100644
+--- a/src/yor_v3_calib/collect.py
++++ b/src/yor_v3_calib/collect.py
+@@ -4,6 +4,7 @@ from pathlib import Path
+ 
+ import cv2
+ import numpy as np
++import time
+ 
+ from .calibration import marker_points
+ from .config import DATA, ROBOT_HOST, CAMERA_HOST, load_calibration
+@@ -20,6 +21,9 @@ def main():
+     p.add_argument("--aruco-id", type=int, default=0)
+     p.add_argument("--data", type=Path, default=DATA)
+     p.add_argument("--check", type=Path, help="Check a saved calibration instead of collecting")
++    p.add_argument("--require-fresh", action="store_true")
++    p.add_argument("--refine-template", action="store_true")
++    p.add_argument("--marker-size-mm", type=float, default=65.)
+     args = p.parse_args()
+     client = CalibrationDataCollector(args.robot_host, args.robot_port, args.camera_host,
+                                       args.camera_port, args.aruco_id)
+@@ -43,8 +47,12 @@ def main():
+             if not np.allclose(f["camera_matrix"], K) or not np.allclose(f["dist_coeffs"], D):
+                 raise ValueError("Camera intrinsics changed; use a new --data directory")
+     T = load_calibration(args.check) if args.check else None
++    marker_size_m = args.marker_size_mm / 1000
++    marker_correction = None
+     if args.check:
+         with np.load(args.check) as f:
++            marker_size_m = float(f['marker_size_m']) if 'marker_size_m' in f else .065
++            marker_correction = f['marker_correction'] if 'marker_correction' in f else None
+             if not np.allclose(f["camera_matrix"], K) or not np.allclose(f["dist_coeffs"], D):
+                 raise ValueError("Live intrinsics differ from the calibration")
+     read_q = getattr(robot, f"get_{args.arm}_joint_positions")
+@@ -52,9 +60,11 @@ def main():
+     try:
+         while input(f"[{len(joints)} saved] capture/check > ").strip().lower() != "q":
+             before = np.asarray(read_q(), dtype=np.float64).reshape(-1)
+-            # Discard buffered frames while the arm is stationary.
+-            for _ in range(3):
+-                bgr = client.get_rgb_frame()
++            if args.require_fresh:
++                bgr = client.get_rgb_frame(after_time=time.time())
++            else:
++                for _ in range(3):
++                    bgr = client.get_rgb_frame()
+             after = np.asarray(read_q(), dtype=np.float64).reshape(-1)
+             if before.shape != (7,) or after.shape != (7,) or not np.isfinite([before, after]).all():
+                 print("Invalid joint reading; skipped")
+@@ -62,11 +72,13 @@ def main():
+             if np.max(np.abs(after - before)) > .005:
+                 print("Arm was moving; skipped")
+                 continue
+-            uv = aruco_corners_for_id(bgr, args.aruco_id)
++            uv = (aruco_corners_for_id(bgr, args.aruco_id, refine_template=True)
++                  if args.refine_template else aruco_corners_for_id(bgr, args.aruco_id))
+             if uv is None:
+                 print("Requested marker not detected uniquely; skipped")
+                 continue
+-            xyz = marker_points(after[None], args.arm)[0]
++            xyz = marker_points(after[None], args.arm, marker_size_m=marker_size_m,
++                                marker_correction=marker_correction)[0]
+             if T is None:
+                 joints.append(after.copy())
+                 corners.append(uv.copy())
+diff --git a/src/yor_v3_calib/collect_auto.py b/src/yor_v3_calib/collect_auto.py
+index cded041..dcd91cf 100644
+--- a/src/yor_v3_calib/collect_auto.py
++++ b/src/yor_v3_calib/collect_auto.py
+@@ -1,7 +1,9 @@
+-"""Collect a requested number of valid left-arm samples with bounded joint moves.
++"""Collect a requested number of valid samples with bounded joint moves.
+ 
+-Starts at the measured arm pose using the bundled live client.
+-Every invocation creates a new dataset; it does not home the robot.
++The arm carrying the marker is the arm that moves; the opposite arm must stay
++put and is checked every capture. Starts at the measured arm pose using the
++bundled live client. Every invocation creates a new dataset; it does not home
++the robot.
+ """
+ import argparse
+ from datetime import datetime
+@@ -17,19 +19,26 @@ from .config import ARUCO_MJCF, ARM_JOINTS, CORNER_SITES, DATA, ROBOT_HOST, CAME
+ from .calibration import marker_points
+ 
+ 
+-def plan_poses(q0, qr0, uv, K, image_shape, count, seed=73):
++def opposite_arm(side):
++    if side not in ARM_JOINTS:
++        raise ValueError("side must be left or right")
++    return "right" if side == "left" else "left"
++
++
++def plan_poses(q0, qo0, uv, K, image_shape, count, side="left", seed=73):
+     """Reject joint-limit, model-contact, large-displacement and invisible goals."""
++    other = opposite_arm(side)
+     m = mujoco.MjModel.from_xml_path(str(ARUCO_MJCF))
+     d = mujoco.MjData(m)
+     d.qpos[:] = initial_q(m)
+-    for side, q in (("left", q0), ("right", qr0)):
+-        for name, value in zip(ARM_JOINTS[side], q):
++    for s, q in ((side, q0), (other, qo0)):
++        for name, value in zip(ARM_JOINTS[s], q):
+             d.joint(name).qpos[0] = value
+     mujoco.mj_forward(m, d)
+-    ids = [m.joint(n).id for n in ARM_JOINTS["left"]]
+-    sites = [m.site(n).id for n in CORNER_SITES["left"]]
++    ids = [m.joint(n).id for n in ARM_JOINTS[side]]
++    sites = [m.site(n).id for n in CORNER_SITES[side]]
+     xyz = d.site_xpos[sites].copy()
+-    ee0 = d.site("left_arm_ee").xpos.copy()
++    ee0 = d.site(f"{side}_arm_ee").xpos.copy()
+     ok, r, t = cv2.solvePnP(xyz, np.asarray(uv, dtype=float), K, np.zeros(5), flags=cv2.SOLVEPNP_SQPNP)
+     if not ok:
+         raise RuntimeError("Could not estimate initial marker visibility")
+@@ -42,7 +51,7 @@ def plan_poses(q0, qr0, uv, K, image_shape, count, seed=73):
+             continue
+         d.qpos[m.jnt_qposadr[ids]] = q
+         mujoco.mj_forward(m, d)
+-        if d.ncon or np.linalg.norm(d.site("left_arm_ee").xpos-ee0) > .065:
++        if d.ncon or np.linalg.norm(d.site(f"{side}_arm_ee").xpos-ee0) > .065:
+             continue
+         xyz1 = d.site_xpos[sites].copy()
+         camera = xyz1 @ cv2.Rodrigues(r)[0].T + t.ravel()
+@@ -62,16 +71,23 @@ def plan_poses(q0, qr0, uv, K, image_shape, count, seed=73):
+ 
+ def main():
+     p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("--arm", choices=tuple(ARM_JOINTS), default="left",
++                   help="Arm carrying the marker; this is the arm that moves")
+     p.add_argument("--count", type=int, default=50, help="Number of valid samples, not attempts")
+     p.add_argument("--robot-host", default=ROBOT_HOST)
+     p.add_argument("--robot-port", type=int, default=5557)
+     p.add_argument("--camera-host", default=CAMERA_HOST)
+     p.add_argument("--camera-port", type=int, default=5555)
+     p.add_argument("--aruco-id", type=int, default=0)
++    p.add_argument("--require-fresh", action="store_true",
++                   help="Require synchronized camera capture timestamps after settling")
++    p.add_argument("--seed", type=int, default=73, help="Pose sampling seed")
++    p.add_argument("--refine-template", action="store_true", help="Align decoded marker interior")
+     p.add_argument("--output", type=Path, help="New directory; existing paths are refused")
+     args = p.parse_args()
+     if args.count < 6:
+         p.error("--count must be at least 6 for calibration")
++    side, other = args.arm, opposite_arm(args.arm)
+     out = args.output or DATA / datetime.now().strftime("live_%Y%m%d_%H%M%S_%f")
+     out.mkdir(parents=True, exist_ok=False)
+     from .live import CalibrationDataCollector, aruco_corners_for_id
+@@ -79,46 +95,52 @@ def main():
+     c = CalibrationDataCollector(args.robot_host, args.robot_port, args.camera_host, args.camera_port,
+                                  args.aruco_id, rpc_rcvtimeo_ms=5000)
+     c.robot.socket.setsockopt(zmq.SNDTIMEO, 5000)
+-    q0 = np.asarray(c.robot.get_left_joint_positions(), dtype=float)
+-    qr0 = np.asarray(c.robot.get_right_joint_positions(), dtype=float)
+-    if q0.shape != (7,) or qr0.shape != (7,) or not np.isfinite([q0, qr0]).all():
++    # Resolved up front: a missing target RPC must fail before anything moves.
++    read_active = getattr(c.robot, f"get_{side}_joint_positions")
++    read_opposite = getattr(c.robot, f"get_{other}_joint_positions")
++    set_target = getattr(c.robot, f"set_{side}_joint_target")
++    q0 = np.asarray(read_active(), dtype=float)
++    qo0 = np.asarray(read_opposite(), dtype=float)
++    if q0.shape != (7,) or qo0.shape != (7,) or not np.isfinite([q0, qo0]).all():
+         raise RuntimeError("Invalid initial joint readings")
+     K = c.fetch_intrinsics()
+-    frame = c.get_rgb_frame()
+-    uv = None if frame is None else aruco_corners_for_id(frame, args.aruco_id)
++    frame = c.get_rgb_frame(after_time=time.time()) if args.require_fresh else c.get_rgb_frame()
++    uv = None if frame is None else aruco_corners_for_id(frame, args.aruco_id,
++                                                       refine_template=args.refine_template)
+     if K is None or uv is None:
+         raise RuntimeError("Camera intrinsics and a visible marker are required before motion")
+-    plans = plan_poses(q0, qr0, uv, K, frame.shape, max(40, args.count*3))
+-    np.save(out / "initial_left_q.npy", q0)
+-    np.save(out / "initial_right_q.npy", qr0)
+-    np.save(out / "planned_left_q.npy", plans)
++    plans = plan_poses(q0, qo0, uv, K, frame.shape, max(40, args.count*3), side, args.seed)
++    np.save(out / f"initial_{side}_q.npy", q0)
++    np.save(out / f"initial_{other}_q.npy", qo0)
++    np.save(out / f"planned_{side}_q.npy", plans)
+     np.savez(out / "camera_intrinsics.npz", camera_matrix=K, dist_coeffs=np.zeros(5))
+     cv2.imwrite(str(out / "initial_rgb.png"), frame)
+     (out / "settings.json").write_text(json.dumps({**vars(args), "output": str(out)}, indent=2))
++    print(f"Moving the {side} arm; the {other} arm must stay put", flush=True)
+     print(f"Saving {args.count} valid samples to {out.resolve()}", flush=True)
+     joints, corners, log = [], [], []
+ 
+-    def read_left():
+-        q = np.asarray(c.robot.get_left_joint_positions(), dtype=float)
++    def read_q():
++        q = np.asarray(read_active(), dtype=float)
+         if q.shape != (7,) or not np.isfinite(q).all() or np.max(np.abs(q-q0)) > .16:
+             raise RuntimeError("Invalid joints or measured arm outside the planned neighborhood")
+         return q
+ 
+     def move(target):
+-        start = read_left()
++        start = read_q()
+         if np.max(np.abs(target-q0)) > .101:
+             raise RuntimeError("Target exceeds the joint movement envelope")
+         steps = max(1, int(np.ceil(np.max(np.abs(target-start))/.003)))
+         for k in range(1, steps+1):
+             command = start+(target-start)*(k/steps)
+-            c.robot.set_left_joint_target(command)
++            set_target(command)
+             time.sleep(.05)
+-            if k % 10 == 0 and np.max(np.abs(read_left()-command)) > .08:
++            if k % 10 == 0 and np.max(np.abs(read_q()-command)) > .08:
+                 raise RuntimeError("Joint tracking error exceeded 0.08 rad")
+-        previous, stable = read_left(), 0
++        previous, stable = read_q(), 0
+         for _ in range(60):
+             time.sleep(.1)
+-            current = read_left()
++            current = read_q()
+             stable = stable+1 if np.max(np.abs(current-previous)) <= .002 else 0
+             previous = current
+             if stable >= 5 and np.max(np.abs(current-target)) < .03:
+@@ -133,16 +155,23 @@ def main():
+                 break
+             print(f"Candidate {index}; {len(joints)}/{args.count} saved", flush=True)
+             move(target)
+-            before = read_left()
+-            for _ in range(3):
+-                frame = c.get_rgb_frame()
+-                time.sleep(.12)
+-            uv = None if frame is None else aruco_corners_for_id(frame, args.aruco_id)
+-            q = read_left()
+-            right = np.asarray(c.robot.get_right_joint_positions(), dtype=float)
+-            if right.shape != (7,) or not np.isfinite(right).all() or np.max(np.abs(right-qr0)) > .04:
++            before = read_q()
++            settled_at = time.time()
++            if args.require_fresh:
++                frame = c.get_rgb_frame(after_time=settled_at)
++            else:
++                for _ in range(3):
++                    frame = c.get_rgb_frame()
++                    time.sleep(.12)
++            uv = None if frame is None else aruco_corners_for_id(frame, args.aruco_id,
++                                                               refine_template=args.refine_template)
++            q = read_q()
++            held = np.asarray(read_opposite(), dtype=float)
++            if held.shape != (7,) or not np.isfinite(held).all() or np.max(np.abs(held-qo0)) > .04:
+                 raise RuntimeError("Unexpected opposite-arm state")
+             entry = {"candidate": index, "marker_found": uv is not None,
++                     "settled_at": settled_at,
++                     "frame_metadata": getattr(c, "last_frame_metadata", {}),
+                      "max_capture_drift_rad": float(np.max(np.abs(q-before)))}
+             if frame is not None:
+                 cv2.imwrite(str(out / f"candidate_{index:03d}.png"), frame)
+@@ -150,22 +179,22 @@ def main():
+                 joints.append(q.copy())
+                 corners.append(uv.copy())
+                 entry["sample"] = len(joints)
+-                np.save(out / "joint_angles_left.npy", joints)
+-                np.save(out / "two_d_coordinates_left.npy", corners)
++                np.save(out / f"joint_angles_{side}.npy", joints)
++                np.save(out / f"two_d_coordinates_{side}.npy", corners)
+                 print(f"SAVED {len(joints)}/{args.count}", flush=True)
+             log.append(entry)
+             (out / "collection_log.json").write_text(json.dumps(log, indent=2))
+         print("Returning to the initial measured joint pose", flush=True)
+         move(q0)
+-        np.save(out / "final_left_q.npy", read_left())
++        np.save(out / f"final_{side}_q.npy", read_q())
+     except BaseException:
+         try:
+-            c.robot.set_left_joint_target(read_left())
++            set_target(read_q())
+         except Exception:
+             pass
+         raise
+     if joints:
+-        np.save(out / "three_d_coordinates_left.npy", marker_points(joints, "left"))
++        np.save(out / f"three_d_coordinates_{side}.npy", marker_points(joints, side))
+     print(f"Saved {len(joints)} samples to {out.resolve()}", flush=True)
+     if len(joints) != args.count:
+         raise RuntimeError("Candidate poses exhausted before the requested valid sample count")
+diff --git a/src/yor_v3_calib/live.py b/src/yor_v3_calib/live.py
+index 6af8f93..9191e59 100644
+--- a/src/yor_v3_calib/live.py
++++ b/src/yor_v3_calib/live.py
+@@ -1,9 +1,10 @@
+ """Small client for the existing Nero RPC and rectified Aria camera services."""
+ import cv2
+ import numpy as np
++import time
+ 
+ 
+-def aruco_corners_for_id(bgr, marker_id):
++def aruco_corners_for_id(bgr, marker_id, *, refine_template=False):
+     detector = cv2.aruco.ArucoDetector(
+         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250),
+         cv2.aruco.DetectorParameters(),
+@@ -12,7 +13,33 @@ def aruco_corners_for_id(bgr, marker_id):
+     indices = np.flatnonzero(ids.ravel() == marker_id) if ids is not None else []
+     if len(indices) != 1:
+         return None
+-    return np.asarray(corners[int(indices[0])], dtype=np.float64).reshape(4, 2)
++    uv = np.asarray(corners[int(indices[0])], dtype=np.float64).reshape(4, 2)
++    if not refine_template:
++        return uv
++    # Align the interior code cells. A thin white rim on a dark mount can
++    # otherwise make the detector alternate between inner and outer contours.
++    edge, pad = 168, 36
++    target = np.array([[pad, pad], [pad+edge, pad], [pad+edge, pad+edge],
++                       [pad, pad+edge]], dtype=np.float32)
++    template = np.pad(cv2.aruco.generateImageMarker(
++        cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250), marker_id, edge),
++        pad, constant_values=255)
++    H = cv2.getPerspectiveTransform(uv.astype(np.float32), target)
++    warped = cv2.warpPerspective(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), H, (240, 240))
++    mask = np.zeros((240, 240), np.uint8)
++    mask[pad+18:pad+edge-18, pad+18:pad+edge-18] = 255
++    try:
++        score, W = cv2.findTransformECC(
++            template, warped, np.eye(3, dtype=np.float32), cv2.MOTION_HOMOGRAPHY,
++            (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 1e-5), mask, 5)
++    except cv2.error:
++        return None
++    refined = cv2.perspectiveTransform(
++        cv2.perspectiveTransform(target[None], W), np.linalg.inv(H))[0].astype(float)
++    if (score < .95 or not np.isfinite(refined).all()
++            or np.max(np.linalg.norm(refined-uv, axis=1)) > .2 * np.linalg.norm(uv[1]-uv[0])):
++        return None
++    return refined
+ 
+ 
+ def camera_intrinsics(packet):
+@@ -51,7 +78,21 @@ class CalibrationDataCollector:
+         K, self.size = camera_intrinsics(self.meta.get('online_calib'))
+         return K
+ 
+-    def get_rgb_frame(self):
++    def get_rgb_frame(self, *, after_time=None, timeout=10.):
+         if self.size is None:
+             raise RuntimeError('Fetch intrinsics before requesting frames')
+-        return decode_frame(self.images.get('images'), self.size)
++        deadline = time.monotonic() + timeout
++        while True:
++            packet = self.images.get('images')
++            if after_time is None:
++                break
++            captured = packet.get('capture_time_unix')
++            if captured is None:
++                raise RuntimeError('Fresh capture requires synchronized capture_time_unix from the publisher')
++            if np.isfinite(captured) and after_time < captured <= time.time() + .05:
++                break
++            if time.monotonic() >= deadline:
++                raise TimeoutError('No camera frame captured after the arm settled')
++            time.sleep(.05)
++        self.last_frame_metadata = {k: v for k, v in packet.items() if k != 'rgb'}
++        return decode_frame(packet, self.size)
+diff --git a/tests/test_calibration.py b/tests/test_calibration.py
+index 508ae80..71ad4ca 100644
+--- a/tests/test_calibration.py
++++ b/tests/test_calibration.py
+@@ -81,6 +81,13 @@ def test_marker_and_camera_contract():
+     bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+     uv = aruco_corners_for_id(bgr, 0)
+     np.testing.assert_allclose(uv, [[40, 40], [199, 40], [199, 199], [40, 199]], atol=1)
++    # A multiple of six avoids unequal raster widths of the six printed cells.
++    template_marker = cv2.aruco.generateImageMarker(
++        cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250), 0, 168)
++    template_bgr = cv2.cvtColor(np.pad(template_marker, 36, constant_values=255),
++                               cv2.COLOR_GRAY2BGR)
++    refined = aruco_corners_for_id(template_bgr, 0, refine_template=True)
++    np.testing.assert_allclose(refined, [[36, 36], [203, 36], [203, 203], [36, 203]], atol=1.1)
+     assert aruco_corners_for_id(bgr, 1) is None
+     K, size = camera_intrinsics({'K_rgb': [[100, 0, 120], [0, 100, 120], [0, 0, 1]],
+                                  'rgb_w': 240, 'rgb_h': 240})
+@@ -146,3 +153,59 @@ def test_manual_capture_and_check_without_motion(monkeypatch, tmp_path):
+     monkeypatch.setattr(Client, 'fetch_intrinsics', lambda self: K * 2)
+     with pytest.raises(ValueError, match='intrinsics changed'):
+         collect.main()
++
++
++def test_fresh_capture_rejects_cached_and_untimed_frames(monkeypatch):
++    from yor_v3_calib import live
++    from types import SimpleNamespace
++
++    jpeg = cv2.imencode('.jpg', np.zeros((16, 16, 3), np.uint8))[1].tobytes()
++    packets = iter([{'rgb': jpeg, 'capture_time_unix': 99.},
++                    {'rgb': jpeg, 'capture_time_unix': 101.}])
++    client = live.CalibrationDataCollector.__new__(live.CalibrationDataCollector)
++    client.size = (16, 16)
++    client.images = SimpleNamespace(get=lambda _: next(packets))
++    monkeypatch.setattr(live.time, 'time', lambda: 102.)
++    monkeypatch.setattr(live.time, 'sleep', lambda _: None)
++    assert client.get_rgb_frame(after_time=100.).shape == (16, 16, 3)
++    assert client.last_frame_metadata['capture_time_unix'] == 101.
++    client.images = SimpleNamespace(get=lambda _: {'rgb': jpeg})
++    with pytest.raises(RuntimeError, match='synchronized'):
++        client.get_rgb_frame(after_time=100.)
++    client.images = SimpleNamespace(get=lambda _: {'rgb': jpeg, 'capture_time_unix': 99.})
++    with pytest.raises(TimeoutError, match='after the arm settled'):
++        client.get_rgb_frame(after_time=100., timeout=0.)
++
++
++def test_marker_size_preserves_mount_center():
++    q, xyz, _, _, _ = synthetic('left')
++    smaller = marker_points(q, marker_size_m=.060)
++    np.testing.assert_allclose(smaller.mean(axis=1), xyz.mean(axis=1))
++    np.testing.assert_allclose(np.linalg.norm(smaller[:, 1]-smaller[:, 0], axis=1), .060)
++    with pytest.raises(ValueError, match='Marker size'):
++        marker_points(q, marker_size_m=0.)
++
++
++def test_mount_fit_recovers_camera_on_unseen_poses(tmp_path):
++    from yor_v3_calib.calibration import correct_marker_points, estimate_extrinsics_and_mount
++    q, xyz, _, K, T = synthetic('left')
++    correction = np.eye(4)
++    correction[:3, :3] = cv2.Rodrigues(np.array([.02, -.01, .015]))[0]
++    correction[:3, 3] = [.005, .012, .003]
++    actual = correct_marker_points(xyz, correction)
++    truth = cv2.projectPoints(actual.reshape(-1, 3), cv2.Rodrigues(T[:3, :3])[0],
++                              T[:3, 3], K, np.zeros(5))[0].reshape(-1, 4, 2)
++    rng = np.random.default_rng(12)
++    fit, errors, mask, mount = estimate_extrinsics_and_mount(
++        xyz[:40], truth[:40] + rng.normal(0, .1, (40, 4, 2)), K)
++    held = correct_marker_points(xyz[40:], mount)
++    predicted = cv2.projectPoints(held.reshape(-1, 3), cv2.Rodrigues(fit[:3, :3])[0],
++                                  fit[:3, 3], K, np.zeros(5))[0].reshape(-1, 4, 2)
++    assert np.linalg.norm(predicted-truth[40:], axis=2).mean() < .2
++    assert np.linalg.norm(fit[:3, 3]-T[:3, 3]) < .002
++    assert np.linalg.norm(mount[:3, 3]-correction[:3, 3]) < .002
++    path = tmp_path / 'mount.npz'
++    save_calibration(path, fit, K, np.zeros(5), side='left', errors=errors,
++                     inliers=mask, marker_correction=mount)
++    with np.load(path) as saved:
++        np.testing.assert_allclose(marker_points(q[40:], marker_correction=saved['marker_correction']), held)

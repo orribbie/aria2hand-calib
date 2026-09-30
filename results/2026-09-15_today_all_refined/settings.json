@@ -1,0 +1,13 @@
+{
+  "arm": "left",
+  "sources": [
+    "auto099",
+    "autonice",
+    "autonice12",
+    "autonice126",
+    "autonice127",
+    "train_b"
+  ],
+  "samples": 280,
+  "note": "all 2026-09-15 collections; corners re-detected from the saved candidate images with refine_template=True; joints unchanged"
+}

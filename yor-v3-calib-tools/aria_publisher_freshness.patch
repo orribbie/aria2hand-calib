@@ -1,0 +1,73 @@
+--- a/demos/aria_calib_pub.py
++++ b/demos/aria_calib_pub.py
+@@ -125,8 +125,7 @@
+             state["calib"] = device_calib
+         print("[aria-pub] factory calibration received", flush=True)
+ 
+-    def _rgb_impl(image_data, image_record) -> None:
+-        img = image_data.to_numpy_array()
++    def _rgb_impl(img, image_record, received_at) -> None:
+         with lock:
+             state["frames"] += 1
+             if state["rectify"] is None:
+@@ -161,18 +160,50 @@
+                 buf, format="JPEG", quality=args.quality)
+             pub.publish("online_calib", {"K_rgb": K, "rgb_w": int(size[0]),
+                                          "rgb_h": int(size[1])})
+-            pub.publish("images", {"rgb": buf.getvalue()})
++            sync = sr.get_time_sync()
++            latency_ms = (float(sync.compute_latency_ms(image_record.capture_timestamp_ns))
++                          if sync is not None and sync.is_valid() else None)
++            published_at = time.time()
++            pub.publish("images", {"rgb": buf.getvalue(),
++                                   "capture_timestamp_ns": int(image_record.capture_timestamp_ns),
++                                   "received_at": received_at,
++                                   "published_at": published_at,
++                                   "capture_time_unix": (published_at - latency_ms / 1000
++                                                         if latency_ms is not None else None),
++                                   "latency_ms": latency_ms})
+             with lock:
+                 state["published"] += 1
+         except Exception as exc:
+             print(f"[aria-pub] publish failed: {exc}", flush=True)
+ 
++    # Keep decoding callbacks short: rectification must not back up the video stream.
++    pending = [None]
++    ready = threading.Event()
++    pending_lock = threading.Lock()
++
++    def publish_worker():
++        while not stopping.is_set():
++            if not ready.wait(.2):
++                continue
++            with pending_lock:
++                item = pending[0]
++                pending[0] = None
++                ready.clear()
++            if item is not None:
++                try:
++                    _rgb_impl(*item)
++                except Exception as exc:
++                    print(f"[aria-pub] worker error: {exc}", flush=True)
++
+     def rgb_cb(image_data, image_record) -> None:
+         """Nothing may propagate out of here -- see `stopping` above."""
+         if stopping.is_set():
+             return
+         try:
+-            _rgb_impl(image_data, image_record)
++            item = (image_data.to_numpy_array().copy(), image_record, time.time())
++            with pending_lock:
++                pending[0] = item
++                ready.set()
+         except Exception as exc:                      # noqa: BLE001 - deliberate
+             print(f"[aria-pub] rgb callback error: {exc}", flush=True)
+ 
+@@ -182,6 +213,7 @@
+         sr.set_server_config(sc)
+     sr.register_device_calib_callback(calib_cb)
+     sr.register_rgb_callback(rgb_cb)
++    threading.Thread(target=publish_worker, daemon=True).start()
+ 
+     print("[aria-pub] starting streaming…", flush=True)
+     device.start_streaming()
